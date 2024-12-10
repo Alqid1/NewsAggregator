@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gorilla/mux"
 )
@@ -24,9 +26,12 @@ type NewsShortDetailed struct {
 }
 
 type Comment struct {
-	ID      string `json:"id"`
-	Author  string `json:"author"`
-	Content string `json:"content"`
+	ID        int       `json:"id"`
+	NewsID    int       `json:"news_id"` // ID новости, к которой относится комментарий
+	Author    string    `json:"author"`
+	Text      string    `json:"text"`       // Текст комментария
+	ParentID  int       `json:"parent_id"`  // ID родительского комментария (если это ответ)
+	CreatedAt time.Time `json:"created_at"` // Дата и время создания комментария
 }
 
 type API struct {
@@ -81,16 +86,6 @@ var newsDetails = map[string]NewsFullDetailed{
 	"8":  {"8", "Breaking News 8", "Detailed content of Breaking News 8"},
 	"9":  {"9", "Breaking News 9", "Detailed content of Breaking News 9"},
 	"10": {"10", "Breaking News 10", "Detailed content of Breaking News 10"},
-}
-
-var comments = map[string][]Comment{
-	"1": {
-		{"1", "User1", "Comment for Breaking News 1"},
-		{"2", "User2", "Another comment for Breaking News 1"},
-	},
-	"2": {
-		{"1", "User3", "Comment for Breaking News 2"},
-	},
 }
 
 func (api *API) getLatestNews(w http.ResponseWriter, r *http.Request) {
@@ -184,10 +179,17 @@ func (api *API) getComments(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// Обработчик для добавления комментария
 func (api *API) addComment(w http.ResponseWriter, r *http.Request) {
+	// Извлекаем параметр newsID из URL
 	params := mux.Vars(r)
-	newsID := params["id"]
+	newsIDStr := params["id"]
+
+	// Преобразуем newsID в int
+	newsID, err := strconv.Atoi(newsIDStr)
+	if err != nil {
+		http.Error(w, "Invalid NewsID", http.StatusBadRequest)
+		return
+	}
 
 	// Получаем данные комментария из тела запроса
 	var newComment Comment
@@ -196,14 +198,53 @@ func (api *API) addComment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Добавляем комментарий в список
-	comments[newsID] = append(comments[newsID], newComment)
+	// Логируем полученные данные комментария
+	fmt.Printf("Received Comment: %+v\n", newComment)
 
-	// Отправляем добавленный комментарий в формате JSON
+	// Устанавливаем NewsID для нового комментария
+	newComment.NewsID = newsID
+
+	// Сериализуем Comment в JSON
+	commentJSON, err := json.Marshal(newComment)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to marshal comment: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Логируем JSON, который будет отправлен в микросервис
+	fmt.Println("Sending data to microservice:", string(commentJSON))
+
+	// Создаем HTTP POST запрос к микросервису комментариев
+	url := fmt.Sprintf("http://localhost:8081/comments/%s", newsIDStr)
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewBuffer(commentJSON))
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to create request: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Устанавливаем заголовок Content-Type
+	req.Header.Set("Content-Type", "application/json")
+
+	// Выполняем POST запрос
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to send request to microservice: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Проверяем статус ответа от микросервиса
+	if resp.StatusCode != http.StatusCreated {
+		http.Error(w, fmt.Sprintf("Microservice error: %s", resp.Status), http.StatusInternalServerError)
+		return
+	}
+
+	// Отправляем ответ клиенту
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	if err := json.NewEncoder(w).Encode(newComment); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf("Failed to encode response: %v", err), http.StatusInternalServerError)
 	}
 }
 
