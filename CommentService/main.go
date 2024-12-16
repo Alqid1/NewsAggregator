@@ -86,6 +86,7 @@ func (api *API) getComments(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
 	if err := json.NewEncoder(w).Encode(comments); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to encode response: %v", err), http.StatusInternalServerError)
 	}
@@ -138,11 +139,55 @@ func (api *API) addComment(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(`{"status": "success"}`))
 }
 
+func generateRequestID() string {
+	return fmt.Sprintf("%d", time.Now().UnixNano())
+}
+
+type responseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+// WriteHeader записывает HTTP-статус и сохраняет его в переменную
+func (rw *responseWriter) WriteHeader(statusCode int) {
+	rw.statusCode = statusCode
+	rw.ResponseWriter.WriteHeader(statusCode)
+}
+
+// Write записывает тело ответа
+func (rw *responseWriter) Write(p []byte) (n int, err error) {
+	return rw.ResponseWriter.Write(p)
+}
+
+func HeadersMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestID := r.URL.Query().Get("request_id")
+		if requestID == "" {
+			requestID = generateRequestID()
+		}
+
+		wrappedWriter := &responseWriter{ResponseWriter: w}
+
+		next.ServeHTTP(wrappedWriter, r)
+
+		log.Printf(
+			"Request ID: %s | Time: %s | IP: %s | Status: %d",
+			requestID,
+			time.Now().Format(time.RFC3339),
+			r.RemoteAddr,
+			wrappedWriter.statusCode,
+		)
+
+	})
+}
+
 func main() {
 	db := initDB()
 	defer db.Close()
 
 	api := NewAPI(db)
-
+	api.Router().Use(HeadersMiddleware)
+	http.Handle("/", api.Router())
+	fmt.Println("Server started at http://localhost:8081/")
 	log.Fatal(http.ListenAndServe(":8081", api.r))
 }

@@ -8,14 +8,14 @@ import (
 	"log"
 	"net/http"
 	"strconv"
-	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/mux"
 )
 
 type NewsFullDetailed struct {
-	ID        string    `json:"id"`
+	ID        int       `json:"id"`
 	Title     string    `json:"title"`
 	Author    string    `json:"author"`
 	Content   string    `json:"content"`
@@ -23,7 +23,7 @@ type NewsFullDetailed struct {
 }
 
 type NewsShortDetailed struct {
-	ID        string    `json:"id"`
+	ID        int       `json:"id"`
 	Title     string    `json:"title"`
 	Author    string    `json:"author"`
 	CreatedAt time.Time `json:"created_at"`
@@ -31,22 +31,22 @@ type NewsShortDetailed struct {
 
 type Comment struct {
 	ID        int       `json:"id"`
-	NewsID    int       `json:"news_id"` // ID новости, к которой относится комментарий
+	NewsID    int       `json:"news_id"`
 	Author    string    `json:"author"`
-	Text      string    `json:"text"`       // Текст комментария
-	ParentID  int       `json:"parent_id"`  // ID родительского комментария (если это ответ)
-	CreatedAt time.Time `json:"created_at"` // Дата и время создания комментария
+	Text      string    `json:"text"`
+	ParentID  int       `json:"parent_id"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 type API struct {
-	r *mux.Router // маршрутизатор запросов
+	r *mux.Router
 }
 
 func NewAPI() *API {
 	api := &API{
-		r: mux.NewRouter(), // Инициализация маршрутизатора
+		r: mux.NewRouter(),
 	}
-	api.endpoints() // Настройка маршрутов
+	api.endpoints()
 	return api
 }
 
@@ -56,15 +56,10 @@ func (api *API) Router() *mux.Router {
 
 func (api *API) endpoints() {
 	api.r.HandleFunc("/news", api.getNews).Methods(http.MethodGet)
-	api.r.HandleFunc("/news/filter", api.filterNews).Methods(http.MethodGet)
-	api.r.HandleFunc("/news/{id}/comments", api.getComments).Methods(http.MethodGet)
+	api.r.HandleFunc("/news/{id}", api.getComments).Methods(http.MethodGet)
+	api.r.HandleFunc("/news/{id}", api.getSoloNews).Methods(http.MethodGet)
 	api.r.HandleFunc("/news/{id}/comments", api.addComment).Methods(http.MethodPost)
 }
-
-// Заглушка данных
-var newsList = []NewsShortDetailed{}
-
-var newsDetails = map[string]NewsFullDetailed{}
 
 func (api *API) getNews(w http.ResponseWriter, r *http.Request) {
 	requestID := r.URL.Query().Get("request_id")
@@ -74,8 +69,8 @@ func (api *API) getNews(w http.ResponseWriter, r *http.Request) {
 	page := r.URL.Query().Get("page")
 	s := r.URL.Query().Get("s")
 
-	// Создаем HTTP запрос к микросервису комментариев
-	url := fmt.Sprintf("http://localhost:8082/news?request_id=%s&page=%s&s=%s", requestID, page, s) // Микросервис комментариев на порту 8081
+	// Создаем HTTP запрос к микросервису новостей
+	url := fmt.Sprintf("http://localhost:8082/news?request_id=%s&page=%s&s=%s", requestID, page, s) // Микросервис комментариев на порту 8082
 
 	// Выполняем GET запрос к микросервису
 	resp, err := http.Get(url)
@@ -104,24 +99,120 @@ func (api *API) getNews(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (api *API) filterNews(w http.ResponseWriter, r *http.Request) {
-	// Извлекаем параметры фильтра из строки запроса
-	title := r.URL.Query().Get("title")
-	category := r.URL.Query().Get("category")
+func (api *API) getSoloNews(w http.ResponseWriter, r *http.Request) {
+	param := mux.Vars(r)
+	id := param["id"]
+	requestID := r.URL.Query().Get("request_id")
+	if requestID == "" {
+		requestID = generateRequestID()
+	}
 
-	// Фильтруем новости по названию и категории
-	var filteredNews []NewsShortDetailed
-	for _, news := range newsList {
-		if (title == "" || strings.Contains(news.Title, title)) &&
-			(category == "" || strings.Contains(news.Title, category)) {
-			filteredNews = append(filteredNews, news)
+	resultCh := make(chan interface{}, 2)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Горутина для запроса новости
+	go func() {
+		defer wg.Done()
+		url := fmt.Sprintf("http://localhost:8082/news/%s?request_id=%s", id, requestID)
+		resp, err := http.Get(url)
+		if err != nil {
+			resultCh <- fmt.Errorf("Failed to fetch news: %v", err)
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			resultCh <- fmt.Errorf("Failed to fetch news: %s", resp.Status)
+			return
+		}
+
+		var news NewsFullDetailed
+		if err := json.NewDecoder(resp.Body).Decode(&news); err != nil {
+			resultCh <- fmt.Errorf("Error decoding news response: %v", err)
+			return
+		}
+
+		resultCh <- news
+	}()
+
+	// Горутина для запроса комментариев
+	go func() {
+		defer wg.Done()
+		url := fmt.Sprintf("http://localhost:8081/comments/%s?request_id=%s", id, requestID)
+		resp, err := http.Get(url)
+		if err != nil {
+			resultCh <- fmt.Errorf("Failed to fetch comments: %v", err)
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			resultCh <- fmt.Errorf("Failed to fetch comments: %s", resp.Status)
+			return
+		}
+
+		var comments []Comment
+		if err := json.NewDecoder(resp.Body).Decode(&comments); err != nil {
+			resultCh <- fmt.Errorf("Error decoding comments response: %v", err)
+			return
+		}
+
+		resultCh <- comments
+	}()
+
+	// Ожидаем завершения всех горутин
+	wg.Wait()
+
+	var newsData interface{}
+	var commentData interface{}
+
+	// Получаем данные и ошибки из канала
+	for i := 0; i < 2; i++ {
+		result := <-resultCh
+		switch data := result.(type) {
+		case error:
+			http.Error(w, data.Error(), http.StatusInternalServerError)
+			return
+		case NewsFullDetailed:
+			newsData = data
+		case []Comment:
+			commentData = data
 		}
 	}
 
-	// Отправляем отфильтрованные новости в формате JSON
+	var finalResponse string
+	if newsData != nil {
+		news := newsData.(NewsFullDetailed)
+		finalResponse = fmt.Sprintf("{\"news\": {\"id\": %d, \"title\": \"%s\", \"author\": \"%s\", \"created_at\": \"%s\"},",
+			news.ID, news.Title, news.Author, news.CreatedAt)
+	} else {
+		http.Error(w, "No news data found", http.StatusInternalServerError)
+		return
+	}
+
+	if commentData != nil {
+		comments := commentData.([]Comment)
+		finalResponse += "\"comments\": ["
+		for i, comment := range comments {
+			finalResponse += fmt.Sprintf("{\"id\": %d, \"author\": \"%s\", \"content\": \"%s\", \"created_at\": \"%s\"}",
+				comment.ID, comment.Author, comment.Text, comment.CreatedAt)
+			if i < len(comments)-1 {
+				finalResponse += ","
+			}
+		}
+		finalResponse += "]}"
+	} else {
+		http.Error(w, "No comment data found", http.StatusInternalServerError)
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(filteredNews); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	w.WriteHeader(http.StatusOK)
+	_, err := w.Write([]byte(finalResponse))
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to write response: %v", err), http.StatusInternalServerError)
 	}
 }
 
@@ -133,7 +224,7 @@ func (api *API) getComments(w http.ResponseWriter, r *http.Request) {
 
 	params := mux.Vars(r)
 	newsID := params["id"]
-
+	fmt.Println("testtttttttt")
 	// Создаем HTTP запрос к микросервису комментариев
 	url := fmt.Sprintf("http://localhost:8081/comments/%s?request_id=%s", newsID, requestID) // Микросервис комментариев на порту 8081
 
@@ -188,35 +279,61 @@ func (api *API) addComment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Создаем HTTP POST запрос к микросервису комментариев
-	url := fmt.Sprintf("http://localhost:8081/comments/%s", newsIDStr)
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewBuffer(commentJSON))
+	// Создаем HTTP POST запрос к сервису цензурирования
+	censorURL := "http://localhost:8083/censor"
+	req, err := http.NewRequest(http.MethodPost, censorURL, bytes.NewBuffer(commentJSON))
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to create request: %v", err), http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf("Failed to create request to censor service: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	// Выполняем POST запрос в сервис цензурирования
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to send request to censor service: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Если статус 400, то комментарий не прошел цензуру
+	if resp.StatusCode == http.StatusBadRequest {
+		http.Error(w, "Comment contains forbidden words", http.StatusBadRequest)
+		return
+	} else if resp.StatusCode != http.StatusOK {
+		http.Error(w, fmt.Sprintf("Error from censor service: %s", resp.Status), http.StatusInternalServerError)
+		return
+	}
+
+	// Если цензура прошла успешно, отправляем запрос на создание комментария в сервис комментариев
+	url := fmt.Sprintf("http://localhost:8081/comments/%s", newsIDStr)
+	req, err = http.NewRequest(http.MethodPost, url, bytes.NewBuffer(commentJSON))
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to create request to comment service: %v", err), http.StatusInternalServerError)
 		return
 	}
 
 	req.Header.Set("Content-Type", "application/json")
 
 	// Выполняем POST запрос
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err = client.Do(req)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to send request to microservice: %v", err), http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf("Failed to send request to comment service: %v", err), http.StatusInternalServerError)
 		return
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusCreated {
-		http.Error(w, fmt.Sprintf("Microservice error: %s", resp.Status), http.StatusInternalServerError)
-		return
-	}
-
-	// Отправляем ответ клиенту
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	if err := json.NewEncoder(w).Encode(newComment); err != nil {
-		http.Error(w, fmt.Sprintf("Failed to encode response: %v", err), http.StatusInternalServerError)
+	if resp.StatusCode == http.StatusCreated {
+		// Отправляем успешный ответ
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		if err := json.NewEncoder(w).Encode(newComment); err != nil {
+			http.Error(w, fmt.Sprintf("Failed to encode response: %v", err), http.StatusInternalServerError)
+		}
+	} else {
+		http.Error(w, fmt.Sprintf("Error from comment service: %s", resp.Status), http.StatusInternalServerError)
 	}
 }
 
