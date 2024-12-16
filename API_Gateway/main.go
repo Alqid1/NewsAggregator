@@ -56,7 +56,6 @@ func (api *API) Router() *mux.Router {
 
 func (api *API) endpoints() {
 	api.r.HandleFunc("/news", api.getNews).Methods(http.MethodGet)
-	api.r.HandleFunc("/news/{id}", api.getComments).Methods(http.MethodGet)
 	api.r.HandleFunc("/news/{id}", api.getSoloNews).Methods(http.MethodGet)
 	api.r.HandleFunc("/news/{id}/comments", api.addComment).Methods(http.MethodPost)
 }
@@ -211,45 +210,6 @@ func (api *API) getSoloNews(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, err := w.Write([]byte(finalResponse))
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to write response: %v", err), http.StatusInternalServerError)
-	}
-}
-
-func (api *API) getComments(w http.ResponseWriter, r *http.Request) {
-	requestID := r.URL.Query().Get("request_id")
-	if requestID == "" {
-		requestID = generateRequestID()
-	}
-
-	params := mux.Vars(r)
-	newsID := params["id"]
-	fmt.Println("testtttttttt")
-	// Создаем HTTP запрос к микросервису комментариев
-	url := fmt.Sprintf("http://localhost:8081/comments/%s?request_id=%s", newsID, requestID) // Микросервис комментариев на порту 8081
-
-	// Выполняем GET запрос к микросервису
-	resp, err := http.Get(url)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to fetch comments: %v", err), http.StatusInternalServerError)
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		http.Error(w, fmt.Sprintf("Failed to fetch comments: %s", resp.Status), resp.StatusCode)
-		return
-	}
-
-	bodyBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Error reading response body: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, err = w.Write(bodyBytes)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to write response: %v", err), http.StatusInternalServerError)
 	}
